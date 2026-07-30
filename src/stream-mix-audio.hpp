@@ -1,9 +1,10 @@
 /*
- * Stream Mix - private audio mix engine
+ * Stream Mix - private combined-mix engine.
  *
- * Builds an independent audio_output ("the 7th mix") from per-source audio
- * capture callbacks. This mix exists ONLY for the plugin's streaming output;
- * OBS's own six recording mixes are never touched.
+ * Builds an independent audio_output ("the stream mix") by tapping OBS's six
+ * core recording mixes with audio_output_connect and summing the selected
+ * ones. This mix exists only to feed the stream encoder; OBS's six recording
+ * mixes and the recording output are never modified.
  */
 #pragma once
 
@@ -11,32 +12,24 @@
 #include <media-io/audio-io.h>
 #include <util/deque.h>
 
-#include <memory>
-#include <string>
-#include <vector>
 #include <atomic>
 #include <mutex>
 
-/* Per-source, stream-only controls + jitter buffer. */
+/* One row per OBS recording track (mix index 0..5 == "Track 1..6"). */
 struct sm_track {
-	obs_weak_source_t *weak = nullptr;
-	std::string name;
+	int index = 0;
 
-	/* Stream-mix-only settings (do NOT affect recording). */
-	std::atomic<float> gain{1.0f}; /* linear multiplier */
+	/* Stream-mix-only controls (never affect recording). */
+	std::atomic<bool> include{true};
+	std::atomic<float> gain{1.0f}; /* linear */
 	std::atomic<bool> mute{false};
-	std::atomic<bool> exclude{false};
-
-	/* Simple brick-wall limiter (stream mix only). */
 	std::atomic<bool> limiter{false};
 	std::atomic<float> limiter_threshold{0.891f}; /* ~ -1 dBFS */
 
-	/* One planar-float jitter buffer per channel. Guarded by
-	 * StreamMixAudio::mtx. */
+	/* Per-channel jitter buffer, guarded by StreamMixAudio::mtx. */
 	struct deque buf[MAX_AUDIO_CHANNELS];
-
-	bool cb_added = false;
-	void *engine = nullptr; /* back-pointer to StreamMixAudio */
+	bool connected = false;
+	void *engine = nullptr;
 };
 
 class StreamMixAudio {
@@ -44,45 +37,32 @@ public:
 	StreamMixAudio() = default;
 	~StreamMixAudio();
 
-	/* Open the private audio_output, discover audio sources routed to any
-	 * recording track, and attach capture callbacks. Idempotent. */
 	bool start();
 	void stop();
 	bool active() const { return audio != nullptr; }
 
+	/* The private audio_output the stream encoder is redirected to. */
 	audio_t *handle() const { return audio; }
 	size_t channel_count() const { return channels; }
-	uint32_t sample_rate() const { return samples_per_sec; }
 
-	/* Live control (safe to call while active). */
-	void set_gain(const std::string &name, float linear);
-	void set_mute(const std::string &name, bool mute);
-	void set_exclude(const std::string &name, bool exclude);
-	void set_limiter(const std::string &name, bool on, float threshold);
+	/* Live control (safe while active). idx is 0..5. */
+	void set_include(int idx, bool include);
+	void set_gain(int idx, float linear);
+	void set_mute(int idx, bool mute);
+	void set_limiter(int idx, bool on, float threshold);
 
-	/* Re-scan sources (e.g. after config reload). */
-	void refresh_sources();
-
-	/* --- internal, called from static trampolines / enumerators --- */
-	void on_source_audio(sm_track *t, const struct audio_data *ad,
-			     bool muted);
+	/* --- internal, called from static trampolines --- */
+	void on_track_audio(sm_track *t, const struct audio_data *ad);
 	bool fill_mix(struct audio_output_data *mix, uint32_t frames);
-	void on_source_discovered(obs_source_t *src);
+
+	static constexpr int TRACK_COUNT = MAX_AUDIO_MIXES; /* 6 */
 
 private:
-	sm_track *find_track(const std::string &name);
-	sm_track *ensure_track(obs_source_t *src);
-	void attach(sm_track *t);
-	void detach(sm_track *t);
-
 	audio_t *audio = nullptr;
 	size_t channels = 2;
 	uint32_t samples_per_sec = 48000;
+	size_t max_buffered_frames = 24000;
 
 	mutable std::mutex mtx;
-	std::vector<std::unique_ptr<sm_track>> tracks;
-
-	/* Cap each per-channel buffer so a runaway/faster source can't grow
-	 * unbounded. ~0.5 s at 48 kHz. */
-	size_t max_buffered_frames = 24000;
+	sm_track tracks[TRACK_COUNT];
 };

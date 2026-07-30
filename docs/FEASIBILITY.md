@@ -1,22 +1,19 @@
 # Feasibility analysis
 
-Can a **stock OBS Studio plugin** deliver "6 fully-isolated recording tracks
-**plus** one independent combined mix used only for streaming, with per-track
-stream-only volume"?
+Can a **stock OBS Studio plugin** send a combined mix to the **native Start
+Streaming button** while recording keeps all six tracks isolated — no forks, no
+virtual cables, no duplicate sources?
 
-Short answer:
+**Yes.** This document explains the two constraints people assume make it
+impossible, and the supported integration point that works around both.
 
-- **The naive shape of the feature (a real 7th mix injected into OBS's own
-  streaming output) is *not* possible from a plugin.** Two independent limits
-  in libobs block it. Both are cited below.
-- **The user-facing goal *is* achievable** by not injecting into OBS's stream
-  output at all, and instead having the plugin own its own streaming output fed
-  by a private mix. That is what this project implements. It is one of the
-  extension points the brief explicitly allows ("a custom output module").
+> Earlier revisions of this file concluded the native button could not be used
+> and that a plugin-owned output was required. That conclusion was **wrong**.
+> The corrected mechanism is below.
 
 ---
 
-## Limit 1 — the six-mix ceiling
+## Constraint 1 — the six-mix ceiling (real, but not in the way)
 
 `libobs/media-io/audio-io.h`:
 
@@ -24,88 +21,82 @@ Short answer:
 #define MAX_AUDIO_MIXES 6
 ```
 
-Every audio mix in OBS is one of these six buffers. A source's routing is a
-6-bit mask (`obs_source_set_audio_mixers`), the recording output records a
-subset of the six, and the streaming output reads one of the six. **Recording
-and streaming index the same six buffers.**
+OBS has exactly six audio mixes. Recording and streaming both index these six.
+So "6 isolated recording tracks + a 7th combined track" cannot exist as a
+*track* — there is no 7th slot, and a plugin can't raise a compile-time
+constant.
 
-So "6 isolated recording tracks" consumes all six mixes (one source per mix).
-A 7th, combined mix would be mix index 6 — which does not exist. `6 + 1 = 7 > 6`.
+**Why it doesn't block us:** the combined mix does not need to be one of OBS's
+six mixes. A plugin can open its **own** `audio_output` (via
+`audio_output_open`) that lives entirely outside the six, and *fill* it by
+tapping the six core mixes with `audio_output_connect` (which hands you each
+recording mix's fully-mixed audio). The six recording mixes and the recording
+output are read-only from our side and never change.
 
-A plugin cannot raise `MAX_AUDIO_MIXES`: it is a compile-time constant that
-sizes fixed arrays and bitmasks throughout libobs (`audio_output_data`,
-`obs_source` mixer masks, every encoder/output mix index). Changing it requires
-recompiling libobs — i.e. an OBS fork or an upstream patch.
+## Constraint 2 — the stream encoder assignment (real, but beatable)
 
-**Consequence:** even the manual "check a source into track 1 *and* its own
-track" trick (Advanced Audio Properties) tops out at **5 isolated + 1
-combined**, never 6 + 1.
+At stream start, OBS's output handler assigns the stream audio encoder:
 
-## Limit 2 — no race-free hook to swap the stream audio encoder
+- `frontend/utility/SimpleOutput.cpp:668` / `AdvancedOutput.cpp:319` —
+  `obs_output_set_audio_encoder(streamOutput, <encoder>, 0)`
 
-Suppose you only need ≤5 isolated tracks, leaving a free mix — or suppose (as
-this plugin does) you build a *private* `audio_output` outside the six core
-mixes. You still have to attach a custom audio encoder to the **streaming
-output**. There is no supported, race-free way to do that.
+and this runs **after** the only pre-start frontend event
+(`OBS_FRONTEND_EVENT_STREAMING_STARTING`, `OBSBasic_Streaming.cpp:89`). So you
+cannot win by swapping the output's *encoder* at STREAMING_STARTING — OBS
+overwrites it milliseconds later.
 
-Ordering in `frontend/widgets/OBSBasic_Streaming.cpp`:
+**The key realization:** you don't swap the encoder object. You **redirect the
+encoder's audio source** — which `audio_t` it pulls from — with
+`obs_encoder_set_audio`. OBS never re-calls that at stream start; it only
+assigns the encoder to the output. And `obs_encoder_set_audio` is permitted as
+long as the encoder is **not yet active** (`obs-encoder.c:1250`).
+
+The timing window exists and is comfortable. In `obs-output.c`:
 
 ```
-line 89:  OnEvent(OBS_FRONTEND_EVENT_STREAMING_STARTING);   // only pre-start event
-line 99:  outputHandler->StartStreaming(service);           // runs AFTER
+obs_output_start()
+  └─ obs_output_actual_start()      # info.start(): RTMP begins ASYNC connect
+  └─ do_output_signal("starting")   # line 411  ← encoder assigned, NOT active
+       ...                          # (async) RTMP connects over the network
+  └─ start_audio_encoders()         # line 2430 ← encoder becomes active here
 ```
 
-`StartStreaming()` calls into the output handler, which **unconditionally
-(re)assigns the stream audio encoder**:
+The `"starting"` signal fires synchronously inside `obs_output_start`, right
+after the encoder has been assigned but before the asynchronous RTMP connection
+completes and `start_audio_encoders` marks the encoder active. That is the
+supported hook.
 
-- `frontend/utility/SimpleOutput.cpp:668` — `obs_output_set_audio_encoder(streamOutput, audioStreaming, 0);`
-- `frontend/utility/AdvancedOutput.cpp:319` — `obs_output_set_audio_encoder(streamOutput, streamAudioEnc, 0);`
+## The integration this plugin uses
 
-So anything a plugin sets during `STREAMING_STARTING` is overwritten
-milliseconds later. And by `STREAMING_STARTED` the output is already active, so
-`obs_output_set_audio_encoder` (which no-ops on an active output) can no longer
-change it. There is no frontend event in the gap between "encoder assigned" and
-"output started."
+1. On `OBS_FRONTEND_EVENT_STREAMING_STARTING`: open the private mix, tap the six
+   core recording mixes, and connect a handler to the streaming output's
+   `"starting"` signal.
+2. On `"starting"`: `obs_encoder_set_audio(streamAudioEncoder, privateMix)`.
+   OBS's own encoder now pulls the combined mix. Native button, native encoder,
+   native everything else.
+3. On stream stop: restore the encoder to `obs_get_audio()` and close the mix.
 
-**Consequence:** a plugin cannot redirect OBS's *own* streaming output's audio.
+Recording is untouched (we only *read* its mixes). Streaming carries the
+combined mix. No 7th track is needed because the mix is a private `audio_t`, not
+a track.
 
----
+## Why the earlier "separate output" design is no longer needed
 
-## The workaround this plugin uses
+A previous version created its own `rtmp_output` and required a separate
+Start/Stop control. That worked but violated the "use the native button"
+requirement. The encoder-redirect approach above removes that compromise
+entirely, so the separate-output module was deleted.
 
-Don't fight either limit — sidestep both:
+## Residual limitations
 
-1. **Build a private mix.** Tap each source with
-   `obs_source_add_audio_capture_callback`, mix the taps in a plugin-owned
-   `audio_output` opened with `audio_output_open`. This mix lives entirely
-   outside the six core mixes, so `MAX_AUDIO_MIXES` is irrelevant and OBS's six
-   recording mixes are never touched. (Limit 1 sidestepped.)
-
-2. **Own the streaming output.** Create a plugin `rtmp_output`, reuse the
-   service from `obs_frontend_get_streaming_service()`, attach a video encoder
-   and an audio encoder bound to the private mix via `obs_encoder_set_audio`.
-   Because *we* own this output, nothing in OBS ever reassigns its encoders.
-   (Limit 2 sidestepped.)
-
-The one honest trade-off: you start/stop this stream from the plugin (Tools
-menu, hotkey, or dock) rather than OBS's native **Start Streaming** button. Use
-the plugin's control; leave OBS's button for a separate/normal stream if you
-ever want one.
-
----
-
-## Smallest upstream change that would remove the trade-off
-
-If you wanted the feature wired into OBS's native Stream button with no plugin
-gymnastics, the minimal upstream change is **one of**:
-
-- **Add a dedicated "program/stream" mix** separate from the six recording
-  mixes: a 7th `audio_output` mix that the streaming output reads by default,
-  fed by the same source graph but with its own per-source gain vector. This is
-  the cleanest and is roughly what this plugin prototypes in user space.
-- **Or** raise `MAX_AUDIO_MIXES` (e.g. to 8) *and* add a frontend event fired
-  after the output handler assigns encoders but before `obs_output_start`, so a
-  plugin can legally redirect the stream encoder. This is more invasive and
-  touches every fixed-size mix array.
-
-The first option is the one worth proposing upstream.
+- The redirect targets audio track 0 of the streaming output (the standard
+  single stream track). Multi-track streaming (e.g. some enhanced-broadcast
+  configurations) would need one redirect per stream track — a small extension.
+- The `"starting"`-signal window relies on RTMP's asynchronous connect. For an
+  exotic streaming output that begins data capture *synchronously* inside
+  `info.start` (before `"starting"`), the encoder would already be active and
+  the redirect would be refused (and logged). Standard RTMP/WHIP outputs connect
+  asynchronously, so this is not a concern in practice.
+- Combining tracks sums them: if the *same* source is routed to multiple
+  included tracks it is counted multiple times. The canonical one-source-per-
+  track setup (the whole point of isolated tracks) is summed correctly.

@@ -1,85 +1,73 @@
 # Architecture
 
 ```
- OBS source graph (unchanged)
- ┌───────────────────────────────────────────────┐
- │ Desktop  Mic  Discord  Spotify  Browser  Game  │
- └───┬────────┬──────┬───────┬────────┬──────┬────┘
-     │        │      │       │        │      │        each source stays routed
-     ▼        ▼      ▼       ▼        ▼      ▼        to its own OBS mix/track
-  ╔═══════════════════════════════════════════════╗
-  ║   OBS core: 6 mixes  ->  Recording output      ║   <- COMPLETELY UNTOUCHED
-  ╚═══════════════════════════════════════════════╝
-     │        │      │       │        │      │
-     │ obs_source_add_audio_capture_callback (taps)
-     ▼        ▼      ▼       ▼        ▼      ▼
-  ┌───────────────────────────────────────────────┐
-  │ StreamMixAudio                                 │
-  │  per-source jitter buffers (deque, planar f32) │
-  │  gain / mute / exclude / limiter  (STREAM ONLY)│
-  │  audio_output_open("stream_mix")  = private mix│
-  └───────────────────────┬───────────────────────┘
-                          │ audio_t*  (mix 0)
-                          ▼
-  ┌───────────────────────────────────────────────┐
-  │ StreamMixOutput                                │
-  │  rtmp_output  (plugin-owned)                   │
-  │   + video encoder  (obs_get_video())           │
-  │   + audio encoder  bound to the private mix    │
-  │   + service = obs_frontend_get_streaming_service│
-  └───────────────────────┬───────────────────────┘
-                          ▼
-                    Streaming platform
+ OBS core: 6 recording mixes (Track 1..6)         Recording output
+ ┌───────────────────────────────────────┐        (six isolated tracks,
+ │  mix0  mix1  mix2  mix3  mix4  mix5     │───────► COMPLETELY UNTOUCHED)
+ └──┬─────┬─────┬─────┬─────┬─────┬────────┘
+    │     │     │     │     │     │   audio_output_connect()  (read-only taps)
+    ▼     ▼     ▼     ▼     ▼     ▼
+ ┌───────────────────────────────────────┐
+ │ StreamMixAudio                          │
+ │  per-track jitter buffers (deque)       │
+ │  include / gain / mute / limiter        │  (stream-only)
+ │  audio_output_open("stream_mix")        │  = private audio_t
+ └───────────────────────┬─────────────────┘
+                         │ audio_t*
+                         ▼
+ ┌───────────────────────────────────────┐
+ │ StreamMixHook                           │
+ │  on STREAMING_STARTING → connect to the │
+ │  streaming output's "starting" signal   │
+ │  on "starting" → obs_encoder_set_audio( │
+ │      streamAudioEncoder, privateMix )   │
+ └───────────────────────┬─────────────────┘
+                         ▼
+        OBS's normal streaming output + encoder + Start Streaming button
+                         ▼
+                  Streaming platform  (combined mix)
 ```
 
 ## Modules
 
 | File | Role |
 |------|------|
-| `src/stream-mix-audio.*`  | The private mix. Discovers audio sources routed to any recording track, taps them with `obs_source_add_audio_capture_callback`, buffers per channel in a `deque`, and mixes them in the `audio_output` input callback. Applies stream-only gain/mute/exclude/limiter. |
-| `src/stream-mix-output.*` | Plugin-owned `rtmp_output`. Reuses OBS's configured stream service and inherits encoder settings from the current profile (with overrides). Audio encoder is bound to the private mix. |
-| `src/stream-mix-config.*` | JSON persistence (`config.json`) of encoder settings and per-track overrides. Zero-config defaults. |
-| `src/plugin-main.cpp`     | Module entry, Tools-menu actions, hotkeys, frontend-event cleanup, and the `streammix::` bridge. |
-| `src/stream-mix-dock.cpp` | Optional Qt dock (`-DENABLE_QT_UI=ON`) for live per-track control. |
+| `src/stream-mix-audio.*`  | Opens the private `audio_output`, taps the six core recording mixes with `audio_output_connect`, buffers each, and sums the included tracks (with stream-only gain/mute/limiter) in the mix's input callback. |
+| `src/stream-mix-hook.*`   | Redirects OBS's own streaming audio encoder to the private mix at the streaming output's `"starting"` signal; restores it on stop. |
+| `src/stream-mix-config.*` | JSON persistence of the six per-track settings. Zero-config defaults (all tracks included, unity gain). |
+| `src/plugin-main.cpp`     | Module entry, frontend-event wiring, and the `streammix::` bridge. |
+| `src/stream-mix-dock.cpp` | Qt settings panel: one row per track (include / volume / mute / limiter). |
 
-## The audio path in detail
+## The audio path
 
-1. **Discovery.** `obs_enum_sources` selects sources with `OBS_SOURCE_AUDIO`
-   whose `obs_source_get_audio_mixers() != 0` — i.e. anything routed to a
-   recording track. That is the "all active recording tracks" definition.
-
-2. **Tap.** Each selected source gets an
-   `obs_source_add_audio_capture_callback`. The callback delivers the source's
-   audio already converted to OBS's mix format (float planar, mix sample rate,
-   mix channel count) plus a `muted` flag. No resampling is needed. A globally
-   muted source contributes silence, so the stream matches the recording.
-
-3. **Buffer.** Each source's channels are pushed into per-channel `deque`s.
-   Buffers are capped at ~0.5 s; a source that outruns the mix clock has its
-   oldest audio dropped (prevents unbounded growth / latency creep).
-
-4. **Mix.** The `audio_output`'s input callback pulls the frame-aligned minimum
-   available from every source, applies per-track gain (and optional limiter),
-   and sums into mix 0. Missing/short sources contribute silence for that block.
-   The callback always returns a correctly-timed buffer, so the encoder sees a
-   continuous stream.
-
-5. **Encode + send.** The audio encoder is bound to this `audio_output` with
-   `obs_encoder_set_audio`; the plugin's `rtmp_output` streams it alongside the
-   shared video encoder.
+1. **Tap.** `audio_output_connect(obs_get_audio(), i, NULL, cb, &track[i])` for
+   `i = 0..5`. Each callback receives that recording mix's fully-mixed audio in
+   OBS's native format (float planar, mix sample rate, mix channels) — no
+   resampling. Connecting a listener is what makes OBS produce that mix; it does
+   not alter recording.
+2. **Buffer.** Each track's channels go into per-channel `deque`s, capped at
+   ~0.5 s (oldest dropped if a mix outruns the clock).
+3. **Combine.** The private `audio_output`'s input callback pulls the
+   frame-aligned minimum available from every *included, unmuted* track, applies
+   gain (and optional limiter), and sums into mix 0.
+4. **Redirect.** `StreamMixHook` points OBS's stream encoder at this
+   `audio_output` via `obs_encoder_set_audio`, at the one moment the encoder is
+   assigned but not yet active (`docs/FEASIBILITY.md`).
 
 ## Threading
 
-- Capture callbacks (audio thread) and the mix input callback (audio_output
-  thread) both touch the per-source buffers under a single mutex. Critical
-  sections are small (one 1024-frame block).
-- Live control setters use atomics per field, so gain/mute/exclude changes are
-  lock-light and click-free enough for streaming use.
+- The six tap callbacks (audio thread) and the mix input callback
+  (audio_output thread) share the per-track buffers under one mutex; critical
+  sections are a single 1024-frame block.
+- Per-track settings are atomics, so dock changes are lock-light and take
+  effect on the next audio block.
 
-## Why not just use source mixer bitmasks?
+## Performance
 
-Routing every source into one spare core mix (Advanced Audio Properties) *does*
-produce a combined track using OBS's own mixer — but (a) it costs one of the six
-mixes, capping you at 5 isolated recording tracks, and (b) volume is per-source
-and shared with recording, so there is no **stream-only** volume/compressor.
-The private-mix design removes both restrictions. See `FEASIBILITY.md`.
+- One extra audio mixdown (six mixes → one), plus the private `audio_output`
+  thread. Audio is cheap relative to video; overhead is a fraction of a percent
+  of a CPU core at 48 kHz stereo.
+- **No extra video encode and no second network stream** — unlike the old
+  separate-output design, this reuses OBS's own streaming output and encoders.
+- Added latency is about one audio buffer (~21 ms at 48 kHz), well within
+  normal stream buffering.

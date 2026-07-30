@@ -1,20 +1,19 @@
 /*
  * Stream Mix for OBS Studio
  *
- * Adds an independent "Stream Mix" streaming output that combines every
- * audio source routed to a recording track into a single mixed stream,
- * while OBS keeps recording each source on its own isolated track.
+ * Feeds OBS's normal streaming output a single combined mix of the selected
+ * recording tracks, while recording keeps every track isolated. The user uses
+ * the normal Start Streaming button; there is no separate streaming workflow.
  *
  * See docs/ARCHITECTURE.md and docs/FEASIBILITY.md.
  */
 #include <obs-module.h>
 #include <obs-frontend-api.h>
-#include <util/platform.h>
 
 #include <memory>
 
 #include "stream-mix-audio.hpp"
-#include "stream-mix-output.hpp"
+#include "stream-mix-hook.hpp"
 #include "stream-mix-config.hpp"
 #include "stream-mix-app.hpp"
 
@@ -31,79 +30,38 @@ OBS_MODULE_USE_DEFAULT_LOCALE("stream-mix", "en-US")
 namespace {
 
 std::unique_ptr<StreamMixAudio> g_audio;
-std::unique_ptr<StreamMixOutput> g_output;
+std::unique_ptr<StreamMixHook> g_hook;
 StreamMixConfig g_config;
+bool g_streaming = false;
 
-obs_hotkey_id g_hk_start = OBS_INVALID_HOTKEY_ID;
-obs_hotkey_id g_hk_stop = OBS_INVALID_HOTKEY_ID;
-
-/* Push persisted per-track overrides into the live audio engine. */
+/* Push persisted per-track settings into the live engine. */
 void apply_config()
 {
-	for (const auto &kv : g_config.tracks) {
-		const std::string &name = kv.first;
-		const sm_track_cfg &c = kv.second;
-		g_audio->set_gain(name, StreamMixConfig::db_to_mul(c.gain_db));
-		g_audio->set_mute(name, c.mute);
-		g_audio->set_exclude(name, c.exclude);
-		g_audio->set_limiter(name, c.limiter,
+	for (int i = 0; i < StreamMixConfig::TRACK_COUNT; i++) {
+		const sm_track_cfg &c = g_config.tracks[i];
+		g_audio->set_include(i, c.include);
+		g_audio->set_gain(i, StreamMixConfig::db_to_mul(c.gain_db));
+		g_audio->set_mute(i, c.mute);
+		g_audio->set_limiter(i, c.limiter,
 				     StreamMixConfig::db_to_mul(c.limiter_db));
 	}
 }
 
-void do_start()
-{
-	if (g_output->active()) {
-		blog(LOG_INFO, "Stream Mix already running");
-		return;
-	}
-	g_config.load();
-	if (g_output->start(g_config)) {
-		apply_config();
-	}
-}
-
-void do_stop()
-{
-	g_output->stop();
-}
-
-/* --- Tools menu callbacks --- */
-void menu_start(void *) { do_start(); }
-void menu_stop(void *) { do_stop(); }
-void menu_reload(void *)
-{
-	g_config.load();
-	if (g_audio->active()) {
-		g_audio->refresh_sources();
-		apply_config();
-	}
-	blog(LOG_INFO, "config reloaded");
-}
-
-/* --- Hotkeys --- */
-void hk_start(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed)
-{
-	if (pressed)
-		do_start();
-}
-void hk_stop(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed)
-{
-	if (pressed)
-		do_stop();
-}
-
-/* --- Frontend events --- */
 void on_frontend_event(enum obs_frontend_event event, void *)
 {
 	switch (event) {
+	case OBS_FRONTEND_EVENT_STREAMING_STARTING:
+		g_config.load();
+		g_hook->on_streaming_starting();
+		apply_config();
+		g_streaming = true;
+		break;
+	case OBS_FRONTEND_EVENT_STREAMING_STOPPED:
+		g_hook->on_streaming_stopped();
+		g_streaming = false;
+		break;
 	case OBS_FRONTEND_EVENT_EXIT:
-	case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING:
-	case OBS_FRONTEND_EVENT_PROFILE_CHANGING:
-		if (g_output && g_output->active()) {
-			blog(LOG_INFO, "stopping Stream Mix (frontend event)");
-			do_stop();
-		}
+		g_hook->on_streaming_stopped();
 		break;
 	default:
 		break;
@@ -112,38 +70,44 @@ void on_frontend_event(enum obs_frontend_event event, void *)
 
 } // namespace
 
-/* --- streammix:: bridge (used by the optional Qt dock) --- */
+/* --- streammix:: bridge (used by the Qt dock) --- */
 namespace streammix {
 
 StreamMixAudio *audio() { return g_audio.get(); }
 StreamMixConfig *config() { return &g_config; }
-void start() { do_start(); }
-void stop() { do_stop(); }
-bool active() { return g_output && g_output->active(); }
+bool streaming() { return g_streaming; }
 
-void set_track_gain_db(const std::string &name, float db)
+void set_track_include(int idx, bool include)
 {
-	g_config.tracks[name].gain_db = db;
-	g_audio->set_gain(name, StreamMixConfig::db_to_mul(db));
+	if (idx < 0 || idx >= StreamMixConfig::TRACK_COUNT)
+		return;
+	g_config.tracks[idx].include = include;
+	g_audio->set_include(idx, include);
 	g_config.save();
 }
-void set_track_mute(const std::string &name, bool mute)
+void set_track_gain_db(int idx, float db)
 {
-	g_config.tracks[name].mute = mute;
-	g_audio->set_mute(name, mute);
+	if (idx < 0 || idx >= StreamMixConfig::TRACK_COUNT)
+		return;
+	g_config.tracks[idx].gain_db = db;
+	g_audio->set_gain(idx, StreamMixConfig::db_to_mul(db));
 	g_config.save();
 }
-void set_track_exclude(const std::string &name, bool exclude)
+void set_track_mute(int idx, bool mute)
 {
-	g_config.tracks[name].exclude = exclude;
-	g_audio->set_exclude(name, exclude);
+	if (idx < 0 || idx >= StreamMixConfig::TRACK_COUNT)
+		return;
+	g_config.tracks[idx].mute = mute;
+	g_audio->set_mute(idx, mute);
 	g_config.save();
 }
-void set_track_limiter(const std::string &name, bool on, float db)
+void set_track_limiter(int idx, bool on, float db)
 {
-	g_config.tracks[name].limiter = on;
-	g_config.tracks[name].limiter_db = db;
-	g_audio->set_limiter(name, on, StreamMixConfig::db_to_mul(db));
+	if (idx < 0 || idx >= StreamMixConfig::TRACK_COUNT)
+		return;
+	g_config.tracks[idx].limiter = on;
+	g_config.tracks[idx].limiter_db = db;
+	g_audio->set_limiter(idx, on, StreamMixConfig::db_to_mul(db));
 	g_config.save();
 }
 
@@ -152,24 +116,10 @@ void set_track_limiter(const std::string &name, bool on, float db)
 bool obs_module_load(void)
 {
 	g_audio = std::make_unique<StreamMixAudio>();
-	g_output = std::make_unique<StreamMixOutput>(g_audio.get());
+	g_hook = std::make_unique<StreamMixHook>(g_audio.get());
 	g_config.load();
 
-	obs_frontend_add_tools_menu_item(
-		obs_module_text("Menu.Start"), menu_start, nullptr);
-	obs_frontend_add_tools_menu_item(
-		obs_module_text("Menu.Stop"), menu_stop, nullptr);
-	obs_frontend_add_tools_menu_item(
-		obs_module_text("Menu.Reload"), menu_reload, nullptr);
-
 	obs_frontend_add_event_callback(on_frontend_event, nullptr);
-
-	g_hk_start = obs_hotkey_register_frontend(
-		"stream_mix.start", obs_module_text("Hotkey.Start"),
-		hk_start, nullptr);
-	g_hk_stop = obs_hotkey_register_frontend(
-		"stream_mix.stop", obs_module_text("Hotkey.Stop"), hk_stop,
-		nullptr);
 
 #ifdef ENABLE_QT
 	stream_mix_register_dock();
@@ -182,22 +132,17 @@ bool obs_module_load(void)
 void obs_module_unload(void)
 {
 	obs_frontend_remove_event_callback(on_frontend_event, nullptr);
-	if (g_hk_start != OBS_INVALID_HOTKEY_ID)
-		obs_hotkey_unregister(g_hk_start);
-	if (g_hk_stop != OBS_INVALID_HOTKEY_ID)
-		obs_hotkey_unregister(g_hk_stop);
-
-	if (g_output)
-		g_output->stop();
-	g_output.reset();
+	if (g_hook)
+		g_hook->on_streaming_stopped();
+	g_hook.reset();
 	g_audio.reset();
 	blog(LOG_INFO, "unloaded");
 }
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-	return "Combines all recording tracks into one Stream Mix output for "
-	       "streaming, while recording keeps every source isolated.";
+	return "Sends a combined mix of your recording tracks to the stream, "
+	       "while recording keeps every track isolated.";
 }
 
 MODULE_EXPORT const char *obs_module_name(void)

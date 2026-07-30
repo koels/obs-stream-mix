@@ -13,7 +13,7 @@ project(${_name} VERSION ${_version})
 
 # This plugin requires the frontend API (Tools menu, streaming service, docks).
 option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" ON)
-option(ENABLE_QT "Build the Qt dock for live per-track control" OFF)
+option(ENABLE_QT "Build the Qt settings dock" ON)
 
 include(compilerconfig)
 include(defaults)
@@ -40,7 +40,7 @@ target_sources(
   PRIVATE
     src/plugin-main.cpp
     src/stream-mix-audio.cpp
-    src/stream-mix-output.cpp
+    src/stream-mix-hook.cpp
     src/stream-mix-config.cpp)
 
 if(ENABLE_QT)

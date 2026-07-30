@@ -1,41 +1,22 @@
 /*
- * Stream Mix - optional Qt dock for live per-track control.
+ * Stream Mix - settings panel (Qt dock).
  *
- * Built only when -DENABLE_QT_UI=ON. Everything here is a thin front-end over
- * the streammix:: bridge; no audio logic lives in the UI.
+ * One row per OBS recording track (Track 1..6): include in the Stream Mix,
+ * stream-only volume, mute, and limiter. All changes affect streaming only.
  */
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 
 #include <QWidget>
 #include <QVBoxLayout>
-#include <QHBoxLayout>
-#include <QScrollArea>
-#include <QPushButton>
+#include <QGridLayout>
 #include <QLabel>
 #include <QSlider>
 #include <QCheckBox>
 #include <QString>
 
-#include <vector>
-#include <string>
-
 #include "stream-mix-app.hpp"
 #include "stream-mix-config.hpp"
-
-/* Collect names of audio sources routed to a recording track. */
-static bool collect_source(void *param, obs_source_t *src)
-{
-	auto *names = static_cast<std::vector<std::string> *>(param);
-	if ((obs_source_get_output_flags(src) & OBS_SOURCE_AUDIO) == 0)
-		return true;
-	if (obs_source_get_audio_mixers(src) == 0)
-		return true;
-	const char *n = obs_source_get_name(src);
-	if (n)
-		names->emplace_back(n);
-	return true;
-}
 
 class StreamMixDock : public QWidget {
 public:
@@ -43,108 +24,85 @@ public:
 	{
 		auto *root = new QVBoxLayout(this);
 
-		toggleBtn = new QPushButton(this);
-		refreshToggle();
-		connect(toggleBtn, &QPushButton::clicked, this, [this]() {
-			if (streammix::active())
-				streammix::stop();
-			else
-				streammix::start();
-			refreshToggle();
-		});
-		root->addWidget(toggleBtn);
+		auto *intro = new QLabel(
+			QStringLiteral(
+				"Combined mix sent to the normal Start "
+				"Streaming button.\nRecording tracks are "
+				"unaffected."),
+			this);
+		intro->setWordWrap(true);
+		root->addWidget(intro);
 
-		auto *refreshBtn = new QPushButton(
-			QStringLiteral("Refresh sources"), this);
-		connect(refreshBtn, &QPushButton::clicked, this,
-			[this]() { rebuild(); });
-		root->addWidget(refreshBtn);
-
-		auto *scroll = new QScrollArea(this);
-		scroll->setWidgetResizable(true);
-		rows = new QWidget(scroll);
-		rowsLayout = new QVBoxLayout(rows);
-		rowsLayout->setAlignment(Qt::AlignTop);
-		scroll->setWidget(rows);
-		root->addWidget(scroll, 1);
-
-		rebuild();
-	}
-
-private:
-	void refreshToggle()
-	{
-		toggleBtn->setText(streammix::active()
-					   ? QStringLiteral("Stop Stream Mix")
-					   : QStringLiteral("Start Stream Mix"));
-	}
-
-	void rebuild()
-	{
-		/* Clear existing rows. */
-		QLayoutItem *item;
-		while ((item = rowsLayout->takeAt(0)) != nullptr) {
-			if (item->widget())
-				item->widget()->deleteLater();
-			delete item;
-		}
-
-		std::vector<std::string> names;
-		obs_enum_sources(collect_source, &names);
+		auto *grid = new QGridLayout();
+		grid->addWidget(new QLabel(QStringLiteral("Track"), this), 0, 0);
+		grid->addWidget(new QLabel(QStringLiteral("Include"), this), 0,
+				1);
+		grid->addWidget(new QLabel(QStringLiteral("Volume"), this), 0,
+				2);
+		grid->addWidget(new QLabel(QStringLiteral("dB"), this), 0, 3);
+		grid->addWidget(new QLabel(QStringLiteral("Mute"), this), 0, 4);
+		grid->addWidget(new QLabel(QStringLiteral("Limiter"), this), 0,
+				5);
 
 		StreamMixConfig *cfg = streammix::config();
 
-		for (const std::string &name : names) {
-			sm_track_cfg tc;
-			auto it = cfg->tracks.find(name);
-			if (it != cfg->tracks.end())
-				tc = it->second;
+		for (int i = 0; i < StreamMixConfig::TRACK_COUNT; i++) {
+			const sm_track_cfg &tc = cfg->tracks[i];
+			int r = i + 1;
 
-			auto *row = new QWidget(rows);
-			auto *hl = new QHBoxLayout(row);
+			grid->addWidget(
+				new QLabel(QStringLiteral("Track %1").arg(i + 1),
+					   this),
+				r, 0);
 
-			hl->addWidget(new QLabel(QString::fromStdString(name),
-						 row),
-				      1);
+			auto *inc = new QCheckBox(this);
+			inc->setChecked(tc.include);
+			QObject::connect(inc, &QCheckBox::toggled,
+					 [i](bool on) {
+						 streammix::set_track_include(
+							 i, on);
+					 });
+			grid->addWidget(inc, r, 1);
 
-			auto *vol = new QSlider(Qt::Horizontal, row);
+			auto *vol = new QSlider(Qt::Horizontal, this);
 			vol->setMinimum(-60);
 			vol->setMaximum(20);
 			vol->setValue((int)tc.gain_db);
-			vol->setFixedWidth(120);
-			const std::string n = name;
-			connect(vol, &QSlider::valueChanged, this,
-				[n](int v) {
-					streammix::set_track_gain_db(n,
-								     (float)v);
-				});
-			hl->addWidget(vol);
+			vol->setFixedWidth(140);
+			auto *dbLabel = new QLabel(
+				QString::number((int)tc.gain_db), this);
+			QObject::connect(vol, &QSlider::valueChanged,
+					 [i, dbLabel](int v) {
+						 dbLabel->setText(
+							 QString::number(v));
+						 streammix::set_track_gain_db(
+							 i, (float)v);
+					 });
+			grid->addWidget(vol, r, 2);
+			grid->addWidget(dbLabel, r, 3);
 
-			auto *mute = new QCheckBox(
-				QStringLiteral("Mute"), row);
+			auto *mute = new QCheckBox(this);
 			mute->setChecked(tc.mute);
-			connect(mute, &QCheckBox::toggled, this,
-				[n](bool on) {
-					streammix::set_track_mute(n, on);
-				});
-			hl->addWidget(mute);
+			QObject::connect(mute, &QCheckBox::toggled,
+					 [i](bool on) {
+						 streammix::set_track_mute(i,
+									   on);
+					 });
+			grid->addWidget(mute, r, 4);
 
-			auto *excl = new QCheckBox(
-				QStringLiteral("Exclude"), row);
-			excl->setChecked(tc.exclude);
-			connect(excl, &QCheckBox::toggled, this,
-				[n](bool on) {
-					streammix::set_track_exclude(n, on);
-				});
-			hl->addWidget(excl);
-
-			rowsLayout->addWidget(row);
+			auto *lim = new QCheckBox(this);
+			lim->setChecked(tc.limiter);
+			QObject::connect(lim, &QCheckBox::toggled,
+					 [i, tc](bool on) {
+						 streammix::set_track_limiter(
+							 i, on, tc.limiter_db);
+					 });
+			grid->addWidget(lim, r, 5);
 		}
-	}
 
-	QPushButton *toggleBtn = nullptr;
-	QWidget *rows = nullptr;
-	QVBoxLayout *rowsLayout = nullptr;
+		root->addLayout(grid);
+		root->addStretch(1);
+	}
 };
 
 void stream_mix_register_dock()
