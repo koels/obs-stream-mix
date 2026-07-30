@@ -1,0 +1,14 @@
+{
+  "output": {
+    "video_encoder_id": "",
+    "video_bitrate": 0,
+    "keyint_sec": 2,
+    "audio_encoder_id": "ffmpeg_aac",
+    "audio_bitrate": 0
+  },
+  "tracks": [
+    { "name": "Spotify",       "gain_db": -6.0, "mute": false, "exclude": false },
+    { "name": "Discord",       "gain_db":  3.0, "limiter": true, "limiter_db": -1.0 },
+    { "name": "Game Capture",  "gain_db":  0.0, "exclude": false }
+  ]
+}

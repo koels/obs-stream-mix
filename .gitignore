@@ -1,0 +1,18 @@
+# Build output
+build*/
+release/
+.deps/
+.ccache/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db
