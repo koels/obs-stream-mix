@@ -16,3 +16,7 @@ CMakeUserPresets.json
 *.user
 .DS_Store
 Thumbs.db
+
+# stray downloaded release artifacts
+/stream-mix-*-windows-x64*.zip
+/stream-mix-*-windows-x64-*/
