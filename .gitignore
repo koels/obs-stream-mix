@@ -1,8 +1,8 @@
-# Build output
-build*/
-release/
-.deps/
-.ccache/
+# Build output (anchored to repo root so .github/actions/build-plugin isn't matched)
+/build*/
+/release/
+/.deps/
+/.ccache/
 
 # CMake
 CMakeCache.txt
