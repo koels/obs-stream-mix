@@ -74,7 +74,10 @@ supported hook.
 2. On `"starting"`: `obs_encoder_set_audio(streamAudioEncoder, privateMix)`.
    OBS's own encoder now pulls the combined mix. Native button, native encoder,
    native everything else.
-3. On stream stop: restore the encoder to `obs_get_audio()` and close the mix.
+3. On stream stop: detach the signal only. The private mix is **not** torn down
+   and the encoder is **not** rebound — OBS disconnects the encoder from the mix
+   asynchronously (`end_data_capture_thread`), so freeing the mix on stop is a
+   use-after-free. The mix is opened once and lives for the plugin's lifetime.
 
 Recording is untouched (we only *read* its mixes). Streaming carries the
 combined mix. No 7th track is needed because the mix is a private `audio_t`, not

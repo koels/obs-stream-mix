@@ -38,7 +38,7 @@
     },
     "name": "stream-mix",
     "displayName": "Stream Mix",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "author": "Stream Mix contributors",
     "website": "https://github.com/koels/obs-stream-mix",
     "email": "you@example.com"

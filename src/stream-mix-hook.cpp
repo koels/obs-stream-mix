@@ -19,11 +19,10 @@ static void starting_signal(void *data, calldata_t *cd)
 
 void StreamMixHook::on_streaming_starting()
 {
-	/* Bring up the private mix so it is producing before the encoder
-	 * starts pulling. */
+	/* Open the private mix once and keep it running. Idempotent. */
 	if (!engine->start()) {
-		blog(LOG_ERROR, "failed to start stream mix; stream will use "
-				"OBS's default audio");
+		blog(LOG_ERROR, "failed to open stream mix; the stream will "
+				"use OBS's default audio");
 		return;
 	}
 
@@ -46,33 +45,27 @@ void StreamMixHook::redirect_encoder()
 
 	obs_encoder_t *enc = obs_output_get_audio_encoder(output, 0);
 	if (!enc) {
-		blog(LOG_ERROR, "streaming output has no audio encoder to "
-				"redirect");
+		blog(LOG_ERROR, "streaming output has no audio encoder");
 		return;
 	}
 
 	/* The decisive call: point OBS's own stream encoder at our combined
-	 * mix. Allowed because the encoder is assigned but not yet active. */
+	 * mix. Allowed because the encoder is assigned but not yet active. We
+	 * deliberately never restore it or free the mix on stop -- OBS
+	 * disconnects the encoder asynchronously, and the mix must outlive
+	 * that. */
 	obs_encoder_set_audio(enc, engine->handle());
-	weak_enc = obs_encoder_get_weak_encoder(enc); /* to restore later */
 	blog(LOG_INFO, "streaming audio encoder '%s' redirected to Stream Mix",
 	     obs_encoder_get_name(enc));
 }
 
 void StreamMixHook::on_streaming_stopped()
 {
-	/* Restore the encoder's original audio before we tear down our mix, so
-	 * a reused encoder never references a freed audio_t. */
-	if (weak_enc) {
-		obs_encoder_t *enc = obs_weak_encoder_get_encoder(weak_enc);
-		if (enc) {
-			obs_encoder_set_audio(enc, obs_get_audio());
-			obs_encoder_release(enc);
-		}
-		obs_weak_encoder_release(weak_enc);
-		weak_enc = nullptr;
-	}
-
+	/* Detach the signal and drop our output reference. Do NOT touch the
+	 * encoder and do NOT stop the mix: OBS's end_data_capture_thread is
+	 * (asynchronously) disconnecting the encoder from the mix right now,
+	 * and tearing the mix down here is a use-after-free. The mix stays
+	 * open for the plugin's lifetime. */
 	if (output) {
 		if (signal_connected) {
 			signal_handler_t *sh =
@@ -84,6 +77,4 @@ void StreamMixHook::on_streaming_stopped()
 		obs_output_release(output);
 		output = nullptr;
 	}
-
-	engine->stop();
 }
